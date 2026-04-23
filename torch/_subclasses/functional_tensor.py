@@ -231,16 +231,11 @@ class FunctionalTensor(torch.Tensor):
                 # Otherwise this would be invalid.
                 mode._storage_to_base[out.elem.untyped_storage()] = out
             else:
-                storage = out.elem.untyped_storage()
-                base = mode._storage_to_base.get(storage)
-                if base is None:
-                    # Base tensor was created outside inference_mode (e.g. a
-                    # graph input wrapped before inference_mode was entered).
-                    # Treat this view as a new base for tracking purposes.
-                    mode._storage_to_base[storage] = out
-                    out._inference_mode_base = None
-                else:
-                    out._inference_mode_base = base
+                out._inference_mode_base = mode._storage_to_base[
+                    out.elem.untyped_storage()
+                ]
+                if out._inference_mode_base is None:
+                    raise AssertionError("out._inference_mode_base must not be None")
         return out
 
     def __torch_dispatch__(  # type: ignore[override]
@@ -480,9 +475,7 @@ class FunctionalTensorMode(TorchDispatchMode):
         # runtime by the graph nodes emitted by Dynamo.
         _inference_mode_ctx = None
         if torch.is_inference_mode_enabled():
-            _inference_mode_ctx = torch.autograd.grad_mode._enter_inference_mode(
-                False
-            )
+            _inference_mode_ctx = torch.autograd.grad_mode._enter_inference_mode(False)
         try:
             return self._torch_dispatch_impl(func, types, args, kwargs)
         finally:
@@ -496,7 +489,6 @@ class FunctionalTensorMode(TorchDispatchMode):
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
     ) -> Any:
-
         if (
             func not in FunctionalTensor.metadata_fns
             and self._can_decompose(func, args, kwargs)
