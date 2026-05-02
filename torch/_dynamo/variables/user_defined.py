@@ -44,6 +44,7 @@ import torch._dynamo.config
 import torch.nn
 from torch._C._dynamo import PyNumberSlots
 from torch._guards import Source, TracingContext
+from torch.utils._ordered_set import OrderedSet
 from torch.utils._python_dispatch import is_traceable_wrapper_subclass_type
 from torch.utils._pytree import GetAttrKey, is_structseq_class
 
@@ -1320,6 +1321,10 @@ class UserDefinedExceptionClassVariable(UserDefinedClassVariable):
             var.call_method(tx, "__init__", list(args), dict(kwargs))
             return var
         return super().call_function(tx, args, kwargs)
+
+
+class OrderedSetClassVariable(UserDefinedClassVariable):
+    pass
 
 
 class RemovableHandleClass:
@@ -2967,6 +2972,27 @@ class UserDefinedObjectVariable(UserDefinedVariable):
             tree_map_kwargs,
             keypath,
         )
+
+
+class OrderedSetVariable(UserDefinedObjectVariable):
+    def __init__(self, value: object, **kwargs: Any) -> None:
+        super().__init__(value, **kwargs)
+        self._base_vt = variables.SetVariable(set(), mutation_type=ValueMutationNew())
+        self._base_methods = set_methods
+
+    def debug_repr(self) -> str:
+        return "OrderedSet([...])"
+
+    def python_type(self) -> type[OrderedSet[Any]]:
+        return OrderedSet
+
+    def reconstruct(self, codegen: "PyCodegen") -> None:
+        codegen.add_push_null(
+            lambda: codegen.load_import_from("torch.utils._ordered_set", "OrderedSet")
+        )
+        assert self._base_vt is not None
+        self._base_vt.reconstruct(codegen)
+        codegen.extend_output(create_call_function(1, False))
 
 
 class FrozenDataClassVariable(UserDefinedObjectVariable):
