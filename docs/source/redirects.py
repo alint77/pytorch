@@ -78,6 +78,8 @@ redirects = {
     ),
     "export/pt2_archive": "user_guide/torch_compiler/export/pt2_archive.html",
     "cond": "higher_order_ops/cond.html",
+    # Redirect for RST-to-MD conversion
+    "notes/local_tensor_tutorial": "notes/local_tensor_tutorial.html",
     # Redirects for compile documents moved from source/compile/ to
     # source/user_guide/torch_compiler/compile/
     "compile/dynamic_shapes_advanced_control_options": (
