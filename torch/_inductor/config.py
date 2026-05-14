@@ -1944,8 +1944,7 @@ class triton:
     # Register-tiled persistent reductions: tile the reduction dimension
     # and retain shared source loads in registers across the epilogue.
     register_tiled_persistent_reductions = (
-        os.environ.get("TORCHINDUCTOR_REGISTER_TILED_PERSISTENT_REDUCTIONS", "0")
-        == "1"
+        os.environ.get("TORCHINDUCTOR_REGISTER_TILED_PERSISTENT_REDUCTIONS", "0") == "1"
     )
     register_tiled_persistent_reduction_min_numel: int = int(
         os.environ.get(
