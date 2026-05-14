@@ -528,10 +528,17 @@ class MetaStorageDesc:
     data: torch.UntypedStorage | None
 
     def as_json(self, describer_id: _DescriberId) -> dict[str, object]:
+        def storage_size_json(size: object) -> object:
+            if isinstance(size, torch.SymInt):
+                from torch.fx.experimental.symbolic_shapes import optimization_hint
+
+                return optimization_hint(size, fallback=None)
+            return size if isinstance(size, int) else repr(size)
+
         return {
             "id": self.id,
             "describer_id": describer_id,
-            "size": self.size if isinstance(self.size, int) else repr(self.size),
+            "size": storage_size_json(self.size),
         }
 
 
