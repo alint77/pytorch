@@ -595,10 +595,13 @@ def convolution(
         kwargs["bias"] = None  # type: ignore[typeddict-unknown-key]
         ordered_kwargs_for_cpp_kernel.insert(0, "bias")
     else:
-        bias_tensor = bias
+        bias = ir.ExternKernel.realize_input(bias)  # type: ignore[assignment]
+        assert bias is not None
+
         # Bias can arrive as a generic View (for example from flatten()).
         # Canonicalize it to a layout-backed contiguous tensor before we
         # freeze layout for the backend conv call.
+        bias_tensor = bias
         if isinstance(bias_tensor.data, ir.BaseView) and not isinstance(
             bias_tensor.data, ir.ReinterpretView
         ):
