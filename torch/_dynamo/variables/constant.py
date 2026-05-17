@@ -8,16 +8,24 @@ maintaining type safety through the compilation process.
 
 from __future__ import annotations
 
+import math
 import operator
-from typing import Any, Literal, overload, TYPE_CHECKING
+from typing import Any, cast, Literal, overload, TYPE_CHECKING
 from typing_extensions import override
 
 import torch
-from torch._dynamo.source import GetItemSource
+from torch._dynamo.bytecode_transformation import create_call_function
+from torch._dynamo.source import AttrSource, GetItemSource
 
 from .. import variables
 from ..exc import raise_observed_exception, unimplemented
-from ..utils import common_constant_types, istype, np, raise_args_mismatch
+from ..utils import (
+    cmp_name_to_op_mapping,
+    common_constant_types,
+    istype,
+    np,
+    raise_args_mismatch,
+)
 from .base import ValueMutationNew, VariableTracker
 
 
@@ -526,6 +534,174 @@ class ConstantVariable(VariableTracker):
         # complex: https://github.com/python/cpython/blob/v3.13.0/Objects/complexobject.c#L578 (complex_pos)
         # bool inherits nb_positive from int via slot inheritance.
         return ConstantVariable.create(+self.value)
+
+
+class NumpyScalarVariable(ConstantVariable):
+    """
+    Represents a NumPy scalar specialized by value.
+
+    Tensor operations should see the equivalent Python scalar, while Python-level
+    type checks and reconstruction still observe the original NumPy scalar.
+    """
+
+    _nonvar_fields = {
+        "numpy_value",
+        "numpy_type",
+        *ConstantVariable._nonvar_fields,
+    }
+
+    def __init__(
+        self,
+        value: Any,
+        *,
+        numpy_value: Any | None = None,
+        **kwargs: Any,
+    ) -> None:
+        if np is None:
+            raise AssertionError("numpy must be available for NumpyScalarVariable")
+
+        if numpy_value is None:
+            numpy_value = value
+            value = value.item()
+
+        if not isinstance(numpy_value, np.generic):
+            raise AssertionError(
+                f"Expected np.generic, got {type(numpy_value).__name__}"
+            )
+        if not self.can_use_python_scalar_proxy(numpy_value):
+            raise AssertionError(
+                f"Unsupported NumPy scalar type {type(numpy_value).__name__}"
+            )
+
+        super().__init__(value, **kwargs)
+        self.numpy_value = numpy_value
+        self.numpy_type = type(numpy_value)
+
+    @staticmethod
+    def can_use_python_scalar_proxy(value: Any) -> bool:
+        if np is None:
+            return False
+        if not isinstance(value, (np.floating, np.signedinteger)):
+            return False
+        return ConstantVariable.is_base_literal(value.item())
+
+    @staticmethod
+    def maybe_create_supported(value: Any, context: str) -> VariableTracker | None:
+        if np is None or not isinstance(value, np.generic):
+            return None
+        if NumpyScalarVariable.can_use_python_scalar_proxy(value):
+            return NumpyScalarVariable(value)
+        unimplemented(
+            gb_type="numpy_scalar_comparison_result",
+            context=context,
+            explanation=(
+                "Dynamo cannot safely lower this NumPy scalar comparison "
+                "result as a Python scalar."
+            ),
+            hints=[
+                "Convert the NumPy scalar to a Python scalar outside the compiled region.",
+            ],
+        )
+
+    def __repr__(self) -> str:
+        return f"NumpyScalarVariable({self.numpy_type.__name__}: {self.numpy_value!r})"
+
+    def as_proxy(self) -> Any:
+        return self.value
+
+    def as_python_constant(self) -> Any:
+        return self.numpy_value
+
+    def python_type(self) -> type:
+        return self.numpy_type
+
+    @override
+    def call_obj_hasattr(
+        self, tx: InstructionTranslator, name: str
+    ) -> ConstantVariable:
+        return ConstantVariable.create(hasattr(self.numpy_value, name))
+
+    def hash_impl(self, tx: InstructionTranslator) -> tuple[int, bool]:
+        if (
+            np is not None
+            and isinstance(self.numpy_value, np.floating)
+            and np.isnan(self.numpy_value)
+        ):
+            unimplemented(
+                gb_type="numpy_scalar_nan_hash",
+                context=self.numpy_type.__name__,
+                explanation=(
+                    "Dynamo cannot safely specialize hash() of a NumPy NaN "
+                    "scalar because NaN hashes are object-specific."
+                ),
+                hints=[
+                    "Avoid calling hash() on NumPy NaN scalars inside compiled code.",
+                ],
+            )
+        return hash(self.numpy_value), False
+
+    def var_getattr(self, tx: InstructionTranslator, name: str) -> VariableTracker:
+        member = self.const_getattr(tx, name)
+        source = self.source and AttrSource(self.source, name)
+
+        if (
+            np is not None
+            and isinstance(member, np.generic)
+            and self.can_use_python_scalar_proxy(member)
+        ):
+            return NumpyScalarVariable(member, source=source)
+
+        if not ConstantVariable.is_literal(member):
+            raise NotImplementedError
+        return ConstantVariable.create(member, source=source)
+
+    def const_getattr(self, tx: InstructionTranslator, name: str) -> VariableTracker:
+        if not hasattr(self.numpy_value, name):
+            raise_observed_exception(AttributeError, tx, args=[name])
+        member = getattr(self.numpy_value, name)
+        if callable(member):
+            raise NotImplementedError
+        return member
+
+    def call_method(
+        self,
+        tx: InstructionTranslator,
+        name: str,
+        args: list[VariableTracker],
+        kwargs: dict[str, VariableTracker],
+    ) -> VariableTracker:
+        if name in cmp_name_to_op_mapping and len(args) == 1 and not kwargs:
+            other = args[0]
+            if not other.is_python_constant():
+                return super().call_method(tx, name, args, kwargs)
+            result = cmp_name_to_op_mapping[name](
+                cast(Any, self.numpy_value), other.as_python_constant()
+            )
+            numpy_result = self.maybe_create_supported(
+                result, f"{self.numpy_type.__name__}.{name}"
+            )
+            if numpy_result is not None:
+                return numpy_result
+            return VariableTracker.build(tx, result)
+
+        if name == "item" and not args and not kwargs:
+            return ConstantVariable.create(self.numpy_value.item())
+        return super().call_method(tx, name, args, kwargs)
+
+    def reconstruct(self, codegen: Any) -> None:
+        codegen.add_push_null(
+            lambda: codegen.load_import_from("numpy", self.numpy_type.__name__)
+        )
+        codegen.append_output(codegen.create_load_const(self.value))
+        codegen.extend_output(create_call_function(1, False))
+
+    def reconstruct_pycode(self, codegen: Any) -> str:
+        value = (
+            "float('nan')"
+            if isinstance(self.value, float) and math.isnan(self.value)
+            else repr(self.value)
+        )
+        return f"__import__('numpy').{self.numpy_type.__name__}({value})"
 
 
 CONSTANT_VARIABLE_NONE = ConstantVariable(None)
