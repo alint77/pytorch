@@ -236,6 +236,103 @@ shapes_spec:
         1: None""",
         )
 
+    def test_params_spec_repr_with_varargs_and_varkw(self):
+        sv = ShapeVar("batch")
+        ps = ParamsSpec(
+            {
+                "x": TensorSpec([sv]),
+                "*args": [TensorSpec([sv]), None],
+                "**kwargs": {"foo": IntVar("k")},
+            }
+        )
+        self.assertEqual(
+            repr(ps),
+            """\
+x:
+  Tensor:
+    0: ShapeVar(batch#0, min=0)
+*args:
+  0:
+    Tensor:
+      0: ShapeVar(batch#0, min=0)
+  1: None
+**kwargs:
+  foo: IntVar(k#1)""",
+        )
+
+    def test_params_spec_to_jsonable_named_only(self):
+        ps = ParamsSpec({"x": TensorSpec([ShapeVar("batch"), None])})
+        obj = ps.to_jsonable()
+        self.assertEqual(obj["type"], "ParamsSpec")
+        self.assertIn("x", obj["params"])
+        self.assertNotIn("*args", obj["params"])
+        self.assertNotIn("**kwargs", obj["params"])
+
+    def test_params_spec_to_jsonable_with_varargs_and_varkw(self):
+        ps = ParamsSpec(
+            {
+                "x": TensorSpec([ShapeVar("batch")]),
+                "*args": [TensorSpec([ShapeVar("a")]), None],
+                "**kwargs": {"foo": IntVar("k")},
+            }
+        )
+        self.assertEqual(
+            ps.to_jsonable(),
+            {
+                "type": "ParamsSpec",
+                "params": {
+                    "x": {
+                        "type": "TensorSpec",
+                        "dims": [
+                            {
+                                "type": "ShapeVar",
+                                "name": "batch",
+                                "min": 0,
+                                "max": None,
+                                "optimization_hint": None,
+                            },
+                        ],
+                    },
+                    "*args": [
+                        {
+                            "type": "TensorSpec",
+                            "dims": [
+                                {
+                                    "type": "ShapeVar",
+                                    "name": "a",
+                                    "min": 0,
+                                    "max": None,
+                                    "optimization_hint": None,
+                                }
+                            ],
+                        },
+                        None,
+                    ],
+                    "**kwargs": {
+                        "foo": {
+                            "type": "IntVar",
+                            "name": "k",
+                            "min": None,
+                            "max": None,
+                            "optimization_hint": None,
+                        }
+                    },
+                },
+            },
+        )
+
+    def test_params_spec_rejects_unknown_sentinel(self):
+        with self.assertRaisesRegex(ValueError, r"Unknown sentinel key"):
+            ParamsSpec({"*unknown": TensorSpec([ShapeVar("a")])})
+
+    def test_params_spec_rejects_bad_varargs_value(self):
+        with self.assertRaisesRegex(ValueError, r"\*args.*must be a list"):
+            ParamsSpec({"*args": TensorSpec([ShapeVar("a")])})  # not a list
+
+    def test_params_spec_rejects_bad_varkw_value(self):
+        with self.assertRaisesRegex(ValueError, r"\*\*kwargs.*must be a dict"):
+            ParamsSpec({"**kwargs": [TensorSpec([ShapeVar("a")])]})  # not a dict
+
 
 class TestShapeVarCompile(TestCase):
     """ShapeVar + torch.compile integration."""
@@ -499,6 +596,216 @@ class TestShapeVarCompile(TestCase):
         self.assertIsNotNone(sym)
         expr = sym.node.expr
         self.assertEqual(sym.node.shape_env.var_to_hint_override.get(expr), 128)
+
+
+class TestVarargsVarkwCompile(TestCase):
+    """ShapesSpec + ``*args`` / ``**kwargs`` integration with ``torch.compile``."""
+
+    def test_varargs_position_marked_dynamic(self):
+        """``ParamsSpec({"*args": [TensorSpec([ShapeVar(...)])]})`` marks the
+        first ``*args`` element's dim 0 as unbacked; a single compile
+        covers all batch sizes at that position."""
+        backend = EagerAndRecordGraphs()
+
+        def fn(*args):
+            return args[0].sum()
+
+        compiled = torch.compile(
+            fn,
+            backend=backend,
+            shapes_spec=ShapesSpec(
+                params=ParamsSpec(
+                    {
+                        "*args": [TensorSpec([ShapeVar("batch")])],
+                    }
+                )
+            ),
+        )
+        for n in [4, 8, 16]:
+            compiled(torch.randn(n))
+
+        self.assertEqual(len(backend.graphs), 1)
+        shape = _tensor_placeholder_shape(backend.graphs[0])
+        self.assertIsInstance(shape[0], torch.SymInt)
+        self.assertGreater(len(free_unbacked_symbols(shape[0])), 0)
+
+    def test_varargs_unspecified_positions_stay_static(self):
+        """Only positions present in ``*args`` get marked dynamic. A position
+        past the end of the spec list is static and re-shaping it triggers a
+        recompile."""
+        backend = EagerAndRecordGraphs()
+
+        def fn(*args):
+            return args[0].sum() + args[1].sum()
+
+        compiled = torch.compile(
+            fn,
+            backend=backend,
+            shapes_spec=ShapesSpec(
+                params=ParamsSpec(
+                    {
+                        "*args": [TensorSpec([ShapeVar("batch")])],
+                    }
+                )
+            ),
+        )
+        x = torch.randn(8)
+        compiled(x, torch.randn(4))
+        compiled(x, torch.randn(8))
+        compiled(x, torch.randn(12))
+        # args[0] is dynamic in dim 0 -> never recompiles for x reshape; args[1]
+        # is past the end of the spec list -> static, so 3 distinct shapes
+        # triggers 3 graphs total.
+        self.assertEqual(len(backend.graphs), 3)
+
+    def test_named_arg_plus_varargs(self):
+        """``def fn(x, *args)`` with both ``"x"`` and ``"*args"`` specs in
+        the same dict — each is independently honored."""
+        backend = EagerAndRecordGraphs()
+
+        def fn(x, *args):
+            return x.sum() + args[0].sum()
+
+        compiled = torch.compile(
+            fn,
+            backend=backend,
+            shapes_spec=ShapesSpec(
+                params=ParamsSpec(
+                    {
+                        "x": TensorSpec([ShapeVar("bx")]),
+                        "*args": [TensorSpec([ShapeVar("by")])],
+                    }
+                )
+            ),
+        )
+        for nx, ny in [(4, 5), (8, 9), (16, 17)]:
+            compiled(torch.randn(nx), torch.randn(ny))
+
+        self.assertEqual(len(backend.graphs), 1)
+        phs = _tensor_placeholders(backend.graphs[0])
+        self.assertEqual(len(phs), 2)
+        x_shape = phs[0].meta["example_value"].shape
+        a_shape = phs[1].meta["example_value"].shape
+        self.assertIsInstance(x_shape[0], torch.SymInt)
+        self.assertIsInstance(a_shape[0], torch.SymInt)
+
+    def test_varkw_value_marked_dynamic(self):
+        """``ParamsSpec({"**kwargs": {"a": TensorSpec([ShapeVar(...)])}})``
+        marks ``kwargs["a"]``'s dim 0 as unbacked; a single compile covers
+        all batch sizes at that key."""
+        backend = EagerAndRecordGraphs()
+
+        def fn(**kwargs):
+            return kwargs["a"].sum()
+
+        compiled = torch.compile(
+            fn,
+            backend=backend,
+            shapes_spec=ShapesSpec(
+                params=ParamsSpec(
+                    {
+                        "**kwargs": {"a": TensorSpec([ShapeVar("batch")])},
+                    }
+                )
+            ),
+        )
+        for n in [4, 8, 16]:
+            compiled(a=torch.randn(n))
+
+        self.assertEqual(len(backend.graphs), 1)
+        shape = _tensor_placeholder_shape(backend.graphs[0])
+        self.assertIsInstance(shape[0], torch.SymInt)
+        self.assertGreater(len(free_unbacked_symbols(shape[0])), 0)
+
+    def test_varkw_unspecified_value_stays_static(self):
+        """Only keys present in ``**kwargs`` get marked dynamic. A key absent
+        from the spec is static and re-shaping it triggers a recompile."""
+        backend = EagerAndRecordGraphs()
+
+        def fn(**kwargs):
+            return kwargs["a"].sum() + kwargs["b"].sum()
+
+        compiled = torch.compile(
+            fn,
+            backend=backend,
+            shapes_spec=ShapesSpec(
+                params=ParamsSpec(
+                    {
+                        "**kwargs": {"a": TensorSpec([ShapeVar("batch")])},
+                    }
+                )
+            ),
+        )
+        a = torch.randn(8)
+        compiled(a=a, b=torch.randn(4))
+        compiled(a=a, b=torch.randn(8))
+        compiled(a=a, b=torch.randn(12))
+        # "a" is dynamic in dim 0; "b" is absent from the spec -> static, so
+        # 3 distinct shapes triggers 3 graphs total.
+        self.assertEqual(len(backend.graphs), 3)
+
+    def test_named_arg_plus_varkw(self):
+        """``def fn(x, **kwargs)`` with both ``"x"`` and ``"**kwargs"``
+        specs in the same dict — each is independently honored."""
+        backend = EagerAndRecordGraphs()
+
+        def fn(x, **kwargs):
+            return x.sum() + kwargs["a"].sum()
+
+        compiled = torch.compile(
+            fn,
+            backend=backend,
+            shapes_spec=ShapesSpec(
+                params=ParamsSpec(
+                    {
+                        "x": TensorSpec([ShapeVar("bx")]),
+                        "**kwargs": {"a": TensorSpec([ShapeVar("ba")])},
+                    }
+                )
+            ),
+        )
+        for nx, na in [(4, 5), (8, 9), (16, 17)]:
+            compiled(torch.randn(nx), a=torch.randn(na))
+
+        self.assertEqual(len(backend.graphs), 1)
+        phs = _tensor_placeholders(backend.graphs[0])
+        self.assertEqual(len(phs), 2)
+        x_shape = phs[0].meta["example_value"].shape
+        a_shape = phs[1].meta["example_value"].shape
+        self.assertIsInstance(x_shape[0], torch.SymInt)
+        self.assertIsInstance(a_shape[0], torch.SymInt)
+
+    def test_varargs_slice_then_index_applies_spec(self):
+        """``args[1:3][0]`` collapses to ``args[1]`` inside dynamo (the slice
+        is resolved statically because ``len(args)`` is known at trace time).
+        The spec at position 1 is applied as if the user wrote ``args[1]``
+        directly."""
+        backend = EagerAndRecordGraphs()
+
+        def fn(*args):
+            return args[1:3][0].sum()
+
+        compiled = torch.compile(
+            fn,
+            backend=backend,
+            fullgraph=True,
+            shapes_spec=ShapesSpec(
+                params=ParamsSpec(
+                    {
+                        "*args": [None, TensorSpec([ShapeVar("a")])],
+                    }
+                )
+            ),
+        )
+        for n in [3, 5, 7]:
+            compiled(torch.randn(3), torch.randn(n))
+
+        self.assertEqual(len(backend.graphs), 1)
+        # Only args[1] survives as a placeholder (args[0] is unused after
+        # the slice). Its dim 0 should be the unbacked symbol from spec[1].
+        shape = _tensor_placeholder_shape(backend.graphs[0])
+        self.assertIsInstance(shape[0], torch.SymInt)
+        self.assertGreater(len(free_unbacked_symbols(shape[0])), 0)
 
 
 if __name__ == "__main__":
