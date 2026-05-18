@@ -1187,12 +1187,9 @@ class CachingAutotuner(KernelInterface):
                             **cloned_kwargs,
                             stream=stream,
                         )
-                    except TypeError as e:
-                        if "got multiple values for argument" in str(e):
-                            kernel_arg_names = list(
-                                self.triton_meta.get("signature", {}).keys()
-                            )
-                            num_expected = len(kernel_arg_names)
+                    except Exception as e:
+                        if isinstance(e, TypeError) and "got multiple values for argument" in str(e):
+                            num_expected = len(self.triton_meta.get("signature", {}))
                             num_received = len(cloned_args) + len(cloned_kwargs)
                             raise TypeError(
                                 f"{kernel_name}() got {num_received} argument(s) "
@@ -1217,12 +1214,9 @@ class CachingAutotuner(KernelInterface):
                         **cloned_kwargs,
                         stream=stream,
                     )
-                except TypeError as e:
-                    if "got multiple values for argument" in str(e):
-                        kernel_arg_names = list(
-                            self.triton_meta.get("signature", {}).keys()
-                        )
-                        num_expected = len(kernel_arg_names)
+                except Exception as e:
+                    if isinstance(e, TypeError) and "got multiple values for argument" in str(e):
+                        num_expected = len(self.triton_meta.get("signature", {}))
                         num_received = len(cloned_args) + len(cloned_kwargs)
                         raise TypeError(
                             f"{kernel_name}() got {num_received} argument(s) "
