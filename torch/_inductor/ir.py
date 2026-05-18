@@ -7309,6 +7309,10 @@ class ExternKernelOut(ExternKernel):
         return True
 
 
+class FallbackKernelOut(ExternKernelOut):
+    """Out-variant extern kernel produced from fallback lowering."""
+
+
 class RandomSeeds(ExternKernelOut):
     def __init__(self, count: int, device: torch.device) -> None:
         limits = torch.iinfo(torch.int64)
@@ -7910,13 +7914,10 @@ class InplaceBernoulliFallback(ExternKernel):
         if V.graph.cpp_wrapper:
             # Inductor doesn't really support aten Generator, so the Generator kwarg is always NULL here,
             # which needs to be explicitly generated for cpp wrapper
-            wrapper.writeline(
-                f"{self.get_kernel_name()}({x}, {', '.join(map(repr, self.constant_args))}, NULL){wrapper.ending}"
-            )
+            line = f"{self.get_kernel_name()}({x}, {', '.join(map(repr, self.constant_args))}, NULL){wrapper.ending}"
         else:
-            wrapper.writeline(
-                f"{self.get_kernel_name()}({x}, {', '.join(map(repr, self.constant_args))}){wrapper.ending}"
-            )
+            line = f"{self.get_kernel_name()}({x}, {', '.join(map(repr, self.constant_args))}){wrapper.ending}"
+        wrapper.codegen_fallback_line(line)
 
     def should_allocate(self) -> bool:
         return False
@@ -7950,7 +7951,7 @@ class InplaceCopyFallback(ExternKernel):
 
     def codegen(self, wrapper: PythonWrapperCodegen) -> None:
         (dst, src, non_blocking) = self.codegen_args()
-        wrapper.codegen_device_copy(src, dst, non_blocking)
+        wrapper.codegen_fallback_device_copy(src, dst, non_blocking)
 
     def should_allocate(self) -> bool:
         return False
@@ -9000,7 +9001,7 @@ class FallbackKernel(ExternKernelAlloc):
                     size=[*example_output.shape],
                     stride=[*example_output.stride()],
                 )
-                return ExternKernelOut(  # type: ignore[return-value]
+                return FallbackKernelOut(  # type: ignore[return-value]
                     layout=layout,
                     inputs=list(tensor_args),
                     constant_args=list(non_tensor_args),
