@@ -1028,6 +1028,61 @@ def has_mergeable_all_gather_convert_dtype(n: torch.fx.Node) -> bool:
     )
 
 
+def _move_deps_before_insertion_point(
+    insert_before: torch.fx.Node,
+    inputs: list[torch.fx.Node],
+    exclude: OrderedSet[torch.fx.Node],
+) -> torch.fx.Node:
+    """Move transitive dependencies of ``inputs`` that appear at or after
+    ``insert_before`` to just before it, preserving their relative order.
+
+    If ``insert_before`` itself is a dependency, it cannot be moved before
+    itself so ``insert_before`` is advanced past all such nodes and the
+    updated value is returned.
+
+    Nodes in ``exclude`` (e.g. the bucket nodes being replaced) are never
+    moved.
+    """
+    if not inputs:
+        return insert_before
+
+    positions: dict[torch.fx.Node, int] = {
+        n: i for i, n in enumerate(insert_before.graph.nodes)
+    }
+    insert_pos = positions[insert_before]
+
+    to_move: list[torch.fx.Node] = []
+    visited: OrderedSet[torch.fx.Node] = OrderedSet()
+    queue = collections.deque(inputs)
+
+    while queue:
+        node = queue.popleft()
+        if node in visited or node in exclude:
+            continue
+        visited.add(node)
+        if positions.get(node, -1) >= insert_pos:
+            to_move.append(node)
+            for inp in node.all_input_nodes:
+                queue.append(inp)
+
+    if not to_move:
+        return insert_before
+
+    to_move.sort(key=lambda n: positions[n])
+    to_move_set = OrderedSet(to_move)
+
+    while insert_before in to_move_set:
+        insert_before = insert_before.next
+        assert insert_before.op != "root", (
+            "_move_deps_before_insertion_point advanced past output node"
+        )
+
+    for node in to_move:
+        insert_before.prepend(node)
+
+    return insert_before
+
+
 def process_collective_bucket(
     g: torch.fx.Graph,
     bucket_nodes: list[torch.fx.Node],
@@ -1084,8 +1139,14 @@ def process_collective_bucket(
     if insert_before is None:
         insert_before = bucket_nodes[-1].next
 
-    # Insert traced function and get replacements + new nodes
     g_fn_inps = bucket_ins + (extra_graph_inps or [])
+    insert_before = _move_deps_before_insertion_point(
+        insert_before,
+        g_fn_inps,
+        exclude=OrderedSet(bucket_nodes) | OrderedSet(bucket_waits),
+    )
+
+    # Insert traced function and get replacements + new nodes
     replacements, new_nodes = _insert_fn_trace_before_node(
         g,
         fn_to_trace,
@@ -1293,6 +1354,7 @@ def merge_all_gather_bucket(
         ag_nodes,
         ag_merge_fn,
         create_trace_args,
+        insert_before=insert_before,
         wait_insertion_point=wait_insertion_point,
         extra_graph_inps=(
             [group_name] if isinstance(group_name, torch.fx.Node) else None
